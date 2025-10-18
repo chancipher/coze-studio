@@ -14,8 +14,8 @@ mysql:
   user: coze
   password: coze123
   persistence:
-    storageClassName: ""
-    size: "50Gi"
+    storageClassName: "nfs-client"
+    size: "20Gi"
   initScripts:
     - files/mysql/schema.sql
 
@@ -63,15 +63,15 @@ redis:
   enabled: true
   image:
     repository: bitnami/redis
-    tag: "7.2"
+    tag: "latest"
   aofEnabled: "no"
   port: 6379
   ioThreads: 4
   allowEmptyPassword: "yes"
   password: ""
   persistence:
-    storageClassName: ""
-    size: "50Gi"
+    storageClassName: "nfs-client"
+    size: "10Gi"
 
 # -- coze-server configuration
 cozeServer:
@@ -80,10 +80,10 @@ cozeServer:
   replicaCount: 1
 
   image:
-    repository: opencoze/opencoze
+    repository: registry.motu.art/opencoze/opencoze
     # -- Keep the mirror up to date
     pullPolicy: Always
-    tag: '0.3.9'
+    tag: 'dev'
 
   service:
     type: LoadBalancer
@@ -97,11 +97,12 @@ cozeServer:
 
   env:
     LISTEN_ADDR: ":8888"
-    SERVER_HOST: "localhost${LISTEN_ADDR}"
+    SERVER_HOST: "https://opencoze.motu.art"
     LOG_LEVEL: "debug"
     MAX_REQUEST_BODY_SIZE: "1073741824"
     STORAGE_TYPE: "minio"
-    MINIO_PROXY_ENDPOINT: ":8889"
+    MINIO_PROXY_ENDPOINT: ""
+    MINIO_API_HOST: "https://minio-opencoze.motu.art"
     COZE_MQ_TYPE: rmq
     ES_VERSION: "v8"
     VECTOR_STORE_TYPE: "milvus"
@@ -132,6 +133,8 @@ cozeServer:
     VE_IMAGEX_DOMAIN: ""
     VE_IMAGEX_TEMPLATE: ""
     VE_IMAGEX_UPLOAD_HOST: "https://imagex.volcengineapi.com"
+    DISABLE_USER_REGISTRATION: "true"
+    ALLOW_REGISTRATION_EMAIL: "*@motu.art,*@lanmoontech.com"
 
 rocketmq:
   enabled: true
@@ -142,11 +145,11 @@ rocketmq:
       tag: 5.3.2
     persistence:
       store:
-        storageClassName: ""
-        size: "20Gi"
+        storageClassName: "nfs-client"
+        size: "5Gi"
       logs:
-        storageClassName: ""
-        size: "20Gi"
+        storageClassName: "nfs-client"
+        size: "5Gi"
     resources:
       limits:
         cpu: 2000m
@@ -182,11 +185,11 @@ rocketmq:
       flushDiskType = ASYNC_FLUSH
     persistence:
       store:
-        storageClassName: ""
-        size: "20Gi"
+        storageClassName: "nfs-client"
+        size: "10Gi"
       logs:
-        storageClassName: ""
-        size: "20Gi"
+        storageClassName: "nfs-client"
+        size: "10Gi"
     resources:
       limits:
         cpu: 4000m
@@ -199,17 +202,17 @@ rocketmq:
 elasticsearch:
   enabled: true
   image:
-    repository: bitnami/elasticsearch
-    tag: 8.18.0
+    repository: bitnamilegacy/elasticsearch
+    tag: "latest"
   javaOpts: "-Djdk.tls.client.protocols=TLSv1.2 -Dhttps.protocols=TLSv1.2 -Djavax.net.ssl.trustAll=true -Xms4096m -Xmx4096m"
   username: ""
   password: ""
   persistence:
     enabled: true
-    storageClassName: ""
+    storageClassName: "nfs-client"
     accessModes:
       - ReadWriteOnce
-    size: 50Gi
+    size: 20Gi
   service:
     type: ClusterIP
     port: 9200
@@ -228,8 +231,8 @@ minio:
     port: 9000
     consolePort: 9001
   persistence:
-    storageClassName: ""
-    size: "50Gi"
+    storageClassName: "nfs-client"
+    size: "20Gi"
   resources:
     limits:
       cpu: 8000m
@@ -241,11 +244,11 @@ minio:
 etcd:
   enabled: true
   image:
-    repository: bitnami/etcd
-    tag: 3.5
+    repository: bitnamilegacy/etcd
+    tag: "latest"
   persistence:
-    storageClassName: ""
-    size: "20Gi"
+    storageClassName: "nfs-client"
+    size: "5Gi"
 
 milvus:
   enabled: true
@@ -254,8 +257,8 @@ milvus:
     tag: v2.5.10
   bucketName: milvus
   persistence:
-    storageClassName: ""
-    size: "20Gi"
+    storageClassName: "nfs-client"
+    size: "10Gi"
 
 
 images:
@@ -291,18 +294,17 @@ service:
 
 # This block is for setting up the ingress for more information can be found here: https://kubernetes.io/docs/concepts/services-networking/ingress/
 ingress:
-  enabled: false
-  className: ''
+  enabled: false 
+  className: 'nginx'
   annotations:
-    {}
-    # kubernetes.io/ingress.class: nginx
-    # kubernetes.io/tls-acme: "true"
+    kubernetes.io/ingress.class: nginx
+    cert-manager.io/cluster-issuer: letsencrypt-issuer
   hosts:
-    - host: chart-example.local
+    - host: opencoze.motu.art
       paths:
         - path: /
-          pathType: ImplementationSpecific
-  tls: []
-  #  - secretName: chart-example-tls
-  #    hosts:
-  #      - chart-example.local
+          pathType: Prefix
+  tls:
+    - hosts:
+        - opencoze.motu.art
+      secretName: opencoze-server-tls

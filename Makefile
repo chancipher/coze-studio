@@ -20,6 +20,9 @@ STATIC_DIR := ./bin/resources/static
 ES_INDEX_SCHEMA := ./docker/volumes/elasticsearch/es_index_schema
 ES_SETUP_SCRIPT := ./docker/volumes/elasticsearch/setup_es.sh
 
+# Ensure default build platform is amd64
+TARGET_PLATFORM ?= linux/amd64
+
 debug: env middleware python server
 
 env:
@@ -63,8 +66,10 @@ middleware:
 	@docker compose -f $(COMPOSE_FILE) --env-file $(ENV_FILE) --profile middleware up -d --wait
 
 build_docker:
-	@echo "Build docker image"
-	@docker compose -f $(COMPOSE_FILE) --profile build-server build
+	@echo "Build docker image for $(TARGET_PLATFORM)"
+	@# Ensure buildx is available and selected
+	@docker buildx inspect >/dev/null 2>&1 || docker buildx create --use >/dev/null 2>&1 || true
+	@DOCKER_DEFAULT_PLATFORM=$(TARGET_PLATFORM) docker compose -f $(COMPOSE_FILE) --profile build-server build
 
 web_env:
 	@if [ ! -f "$(WEB_ENV_FILE)" ]; then \

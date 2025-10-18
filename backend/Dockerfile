@@ -1,10 +1,15 @@
 # Stage 1: Builder for Go application
-FROM golang:1.24-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.24-bookworm AS builder
 
 WORKDIR /app
 
-# Install build dependencies for Go
-RUN apk add --no-cache git gcc libc-dev
+# Target platform (can be overridden by buildx)
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+ENV CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} GOTOOLCHAIN=local
+
+# Install minimal deps for Go (git for go mod)
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/*
 
 # Copy go.mod and go.sum first to leverage Docker cache
 COPY backend/go.mod backend/go.sum ./
@@ -14,7 +19,7 @@ RUN go mod download
 COPY backend/ ./
 
 # Build the Go application
-RUN go build -ldflags="-s -w" -o /app/opencoze main.go
+RUN go build -trimpath -ldflags="-s -w" -o /app/opencoze main.go
 
 
 # Stage 2: Final image
@@ -22,26 +27,20 @@ FROM alpine:3.22.0
 
 WORKDIR /app
 
-# Install runtime dependencies for Go app and base for Python
-# pax-utils for scanelf, python3 for running Python, python3-dev for headers/shared libs
-# bind-tools for nslookup etc., file for debugging file types
-RUN apk add --no-cache pax-utils python3 python3-dev bind-tools file deno curl
+# Install runtime deps; use system numpy/pillow to avoid compiling heavy wheels
+RUN apk add --no-cache \
+    pax-utils python3 py3-numpy py3-pillow \
+    bind-tools file curl
 
-RUN deno run -A jsr:@eyurtsev/pyodide-sandbox -c "print('Hello, World')"
-
-# Install Python build dependencies, create venv, install packages, then remove build deps
-RUN apk add --no-cache --virtual .python-build-deps build-base py3-pip git && \
-    python3 -m venv --copies --upgrade-deps /app/.venv && \
-    # Activate venv and install packages
+# Create venv that can use system site-packages (numpy/pillow)
+RUN python3 -m venv --system-site-packages --copies --upgrade-deps /app/.venv && \
     . /app/.venv/bin/activate && \
-    # If you want to use other third-party libraries, you can install them here.
-    pip install urllib3==1.26.16 && \
-    pip install --no-cache-dir h11==0.16.0 httpx==0.28.1 pillow==11.2.1 pdfplumber==0.11.7 python-docx==1.2.0 numpy==2.3.1 && \
-    # Deactivate (optional, as RUN is a new shell)
-    # deactivate && \
-    # Remove build dependencies
-    apk del .python-build-deps
-
+    pip install --no-cache-dir \
+      urllib3==1.26.16 \
+      h11==0.16.0 \
+      httpx==0.28.1 \
+      pdfplumber==0.11.7 \
+      python-docx==1.2.0
 
 # Copy the built Go binary from the builder stage
 COPY --from=builder /app/opencoze /app/opencoze
@@ -53,7 +52,7 @@ COPY backend/infra/coderunner/impl/script/sandbox.py /app/sandbox.py
 
 
 # Copy static resources
-# COPY backend/static /app/resources/static/
+COPY backend/static /app/resources/static/
 COPY backend/conf /app/resources/conf/
 COPY docker/.env.example /app/.env
 # COPY docker/.env.ve /app/.env

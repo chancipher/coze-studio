@@ -25,22 +25,32 @@ import (
 	"github.com/coze-dev/coze-studio/backend/infra/imagex"
 	"github.com/coze-dev/coze-studio/backend/pkg/ctxcache"
 	"github.com/coze-dev/coze-studio/backend/types/consts"
+	"github.com/coze-dev/coze-studio/backend/bizpkg/env"
 )
 
 func NewStorageImagex(ctx context.Context, endpoint, accessKeyID, secretAccessKey, bucketName string, useSSL bool) (imagex.ImageX, error) {
 	m, err := getMinioClient(ctx, endpoint, accessKeyID, secretAccessKey, bucketName, useSSL)
-	if err != nil {
+	if (err != nil) {
 		return nil, err
 	}
 	return m, nil
 }
 
 func (m *minioClient) GetUploadHost(ctx context.Context) string {
+	// Prefer configured external host
+	if h := env.GetServerHost(); h != "https://" && h != "http://" && h != "" {
+		return h + consts.ApplyUploadActionURI
+	}
+	// Fallback to request scheme + host captured by middleware
 	currentHost, ok := ctxcache.Get[string](ctx, consts.HostKeyInCtx)
-	if !ok {
+	if (!ok) {
 		return ""
 	}
-	return currentHost + consts.ApplyUploadActionURI
+	scheme, ok2 := ctxcache.Get[string](ctx, consts.RequestSchemeKeyInCtx)
+	if (!ok2 || scheme == "") {
+		scheme = "http"
+	}
+	return scheme + "://" + currentHost + consts.ApplyUploadActionURI
 }
 
 func (m *minioClient) GetServerID() string {

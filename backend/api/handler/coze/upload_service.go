@@ -26,6 +26,7 @@ import (
 
 	upload "github.com/coze-dev/coze-studio/backend/api/model/file/upload"
 	uploadSVC "github.com/coze-dev/coze-studio/backend/application/upload"
+	"github.com/coze-dev/coze-studio/backend/bizpkg/env"
 
 	"github.com/coze-dev/coze-studio/backend/pkg/lang/ptr"
 )
@@ -61,15 +62,16 @@ func ApplyUploadAction(ctx context.Context, c *app.RequestContext) {
 		return
 	}
 	resp := new(upload.ApplyUploadActionResponse)
-	host := c.Request.Host()
+	// Prefer configured external SERVER_HOST instead of incoming request Host
+	publicHost := env.GetServerHost()
 	if ptr.From(req.Action) == "ApplyImageUpload" {
-		resp, err = uploadSVC.SVC.ApplyImageUpload(ctx, &req, string(host))
+		resp, err = uploadSVC.SVC.ApplyImageUpload(ctx, &req, publicHost)
 		if err != nil {
 			internalServerErrorResponse(ctx, c, err)
 			return
 		}
 	} else if ptr.From(req.Action) == "CommitImageUpload" {
-		resp, err = uploadSVC.SVC.CommitImageUpload(ctx, &req, string(host))
+		resp, err = uploadSVC.SVC.CommitImageUpload(ctx, &req, publicHost)
 		if err != nil {
 			internalServerErrorResponse(ctx, c, err)
 			return

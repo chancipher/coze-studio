@@ -24,6 +24,8 @@ import (
 	"math/rand"
 	"net/url"
 	"time"
+	"os"
+	"strings"
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -31,6 +33,7 @@ import (
 	"github.com/coze-dev/coze-studio/backend/infra/storage"
 	"github.com/coze-dev/coze-studio/backend/infra/storage/impl/internal/fileutil"
 	"github.com/coze-dev/coze-studio/backend/pkg/logs"
+	"github.com/coze-dev/coze-studio/backend/types/consts"
 )
 
 type minioClient struct {
@@ -39,6 +42,8 @@ type minioClient struct {
 	secretAccessKey string
 	bucketName      string
 	endpoint        string
+	// presign client uses external domain (MINIO_API_HOST) only for generating presigned URLs
+	presign         *minio.Client
 }
 
 func New(ctx context.Context, endpoint, accessKeyID, secretAccessKey, bucketName string, useSSL bool) (storage.Storage, error) {
@@ -67,13 +72,41 @@ func getMinioClient(ctx context.Context, endpoint, accessKeyID, secretAccessKey,
 		endpoint:        endpoint,
 	}
 
-	err = m.createBucketIfNeed(ctx, client, bucketName, "cn-north-1")
+	// Align region to MinIO default to avoid signing region mismatches in presigned URLs.
+	err = m.createBucketIfNeed(ctx, client, bucketName, "us-east-1")
 	if err != nil {
 		return nil, fmt.Errorf("init minio client failed %v", err)
 	}
 
+	// Initialize a presign-only client with external API host if provided.
+	if apiHost := strings.TrimSpace(os.Getenv(consts.MinIOAPIHost)); apiHost != "" {
+		u, perr := url.Parse(apiHost)
+		if perr == nil {
+			secure := (u.Scheme == "https")
+			endpointHost := u.Host // e.g. minio-opencoze.motu.art[:port]
+			if endpointHost != "" {
+				if c2, e2 := minio.New(endpointHost, &minio.Options{
+					Creds:  credentials.NewStaticV4(accessKeyID, secretAccessKey, ""),
+					Secure: secure,
+				}); e2 == nil {
+					m.presign = c2
+				} else {
+					logs.CtxWarnf(ctx, "init presign minio client failed: %v", e2)
+				}
+			}
+		}
+	}
+
 	// m.test()
 	return m, nil
+}
+
+// presignClient returns the client used to generate presigned URLs.
+func (m *minioClient) presignClient() *minio.Client {
+	if (m.presign != nil) {
+		return m.presign
+	}
+	return m.client
 }
 
 func (m *minioClient) createBucketIfNeed(ctx context.Context, client *minio.Client, bucketName, region string) error {
@@ -226,11 +259,12 @@ func (m *minioClient) GetObjectUrl(ctx context.Context, objectKey string, opts .
 	}
 
 	reqParams := make(url.Values)
-	presignedURL, err := m.client.PresignedGetObject(ctx, m.bucketName, objectKey, time.Duration(option.Expire)*time.Second, reqParams)
+	presignedURL, err := m.presignClient().PresignedGetObject(ctx, m.bucketName, objectKey, time.Duration(option.Expire)*time.Second, reqParams)
 	if err != nil {
 		return "", fmt.Errorf("GetObjectUrl failed: %v", err)
 	}
 
+	// Do not rewrite host here; host is part of the signature
 	return presignedURL.String(), nil
 }
 
