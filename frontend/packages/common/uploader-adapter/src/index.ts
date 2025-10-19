@@ -31,11 +31,29 @@ export interface FileOption {
 }
 
 export const getUploader = (config: Config, isOversea?: boolean) => {
-  const imageHost = (
-    config.imageHost ||
-    config.imageFallbackHost ||
-    ''
-  ).replace(/^https:\/\//, config.schema ? `${config.schema}://` : '');
+  // Normalize host: drop any existing scheme, including malformed https// or http//,
+  // then re-add using config.schema if provided.
+  const rawHost = (config.imageHost || config.imageFallbackHost || '').trim();
+  // Remove common scheme prefixes
+  let hostNoScheme = rawHost
+    .replace(/^https:\/\//i, '')
+    .replace(/^http:\/\//i, '')
+    .replace(/^https\/\//i, '') // malformed 'https//' (missing colon)
+    .replace(/^http\/\//i, ''); // malformed 'http//'
+
+  // Ensure no trailing slash to avoid '//apply_upload_action'
+  hostNoScheme = hostNoScheme.replace(/\/$/, '');
+
+  // Derive uploadHost (no scheme) from imageHost path by removing the apply endpoint
+  const uploadHostNoScheme = hostNoScheme.replace(
+    /\/apply_upload_action$/i,
+    '',
+  );
+
+  const imageHost = config.schema
+    ? `${config.schema}://${hostNoScheme}`
+    : hostNoScheme;
+
   const uploader = new Uploader({
     /**
      * The schema needs to be dynamically obtained according to the deployment environment of the current user
@@ -44,6 +62,8 @@ export const getUploader = (config: Config, isOversea?: boolean) => {
     schema: config.schema,
     region: isOversea ? 'ap-singapore-1' : 'cn-north-1',
     imageHost,
+    // Provide uploadHost WITHOUT scheme to avoid double prefix when SDK builds tosDomain
+    uploadHost: uploadHostNoScheme,
     appId: config.appId,
     userId: config.userId,
     useFileExtension: config.useFileExtension,

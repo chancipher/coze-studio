@@ -65,7 +65,7 @@ export class ChatCoreUploadPlugin implements UploadPluginInterface {
           schema,
           useFileExtension: true,
           // cp-disable-next-line
-          imageHost: `https://${upload_host}`, //imageX upload required
+          imageHost: upload_host, // use backend-provided value directly
           imageConfig: {
             serviceId: service_id || '', // The service id applied for in the video cloud.
           },

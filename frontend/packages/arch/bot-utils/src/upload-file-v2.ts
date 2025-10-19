@@ -121,6 +121,9 @@ export function uploadFileV2({
       const { service_id, upload_host, auth, schema } =
         authToken as GetUploadAuthTokenData & { schema?: string };
 
+      // Compose imageHost exactly as we pass to uploader
+      const imageHostParam = upload_host as unknown as string;
+
       const uploader = initUploader(
         {
           schema,
@@ -128,8 +131,8 @@ export function uploadFileV2({
           // Solve the error problem:
           userId,
           appId: APP_ID,
-          // cp-disable-next-line
-          imageHost: `https://${upload_host}`, //imageX upload required
+          // imageHost should be the exact value returned by backend (may include scheme)
+          imageHost: imageHostParam,
           imageConfig: {
             serviceId: service_id || '', // The service id applied for in the video cloud.
           },
@@ -161,6 +164,7 @@ export function uploadFileV2({
       });
 
       onStartUpload?.(fileAndKeyList);
+
       fileAndKeyList.forEach(fileAndKey => {
         uploader.start(fileAndKey.fileKey);
       });

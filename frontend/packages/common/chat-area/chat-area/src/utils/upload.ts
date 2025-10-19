@@ -120,8 +120,8 @@ export function uploadFile({
           // Solve the error problem:
           userId,
           appId: APP_ID,
-          // cp-disable-next-line
-          imageHost: `https://${upload_host}`, //imageX upload required
+          // Use upload_host directly; it already includes scheme and path
+          imageHost: upload_host,
           imageConfig: {
             serviceId: service_id || '', // The service id applied for in the video cloud.
           },
