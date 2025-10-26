@@ -48,6 +48,10 @@ type APIConfig struct {
 	Client *http.Client
 	URL    string
 
+	// UseHPS enables Triton/HPS request wrapping and response parsing.
+	// If nil, it will be auto-detected by URL containing "/v2/models/".
+	UseHPS *bool
+
 	// see: https://paddlepaddle.github.io/PaddleX/latest/pipeline_usage/tutorials/ocr_pipelines/PP-StructureV3.html#3
 	UseDocOrientationClassify        *bool
 	UseDocUnwarping                  *bool
@@ -99,6 +103,14 @@ type ppstructureMarkdown struct {
 	IsEnd   *bool             `json:"isEnd"`
 }
 
+// hpsResponse matches Triton HTTP JSON response schema used by PaddleX HPS.
+type hpsResponse struct {
+	Outputs []struct {
+		Name string   `json:"name"`
+		Data []string `json:"data"`
+	} `json:"outputs"`
+}
+
 func (p *ppstructureParser) Parse(ctx context.Context, reader io.Reader, opts ...parser.Option) (docs []*schema.Document, err error) {
 	// TODO(Bobholamovic): Current chunking strategy is rather naive; we should
 	// implement a more sophisticated one that at least takes tables and text
@@ -114,9 +126,34 @@ func (p *ppstructureParser) Parse(ctx context.Context, reader io.Reader, opts ..
 
 	reqBody := p.newRequestBody(b64, p.fileType, p.parserConfig.ParsingStrategy.ExtractImage, p.parserConfig.ParsingStrategy.ExtractTable)
 
-	bodyBytes, err := json.Marshal(reqBody)
-	if err != nil {
-		return nil, fmt.Errorf("[Parse] failed to serizalize the request body, %w", err)
+	// Build request body depending on serving mode (basic vs HPS/Triton)
+	var bodyBytes []byte
+	if p.isHPS() {
+		innerJSON, err := json.Marshal(reqBody)
+		if err != nil {
+			return nil, fmt.Errorf("[Parse] failed to serialize inner request body, %w", err)
+		}
+		wrapper := map[string]any{
+			"inputs": []map[string]any{
+				{
+					"name":     "input",
+					"shape":    []int{1, 1},
+					"datatype": "BYTES",
+					"data":     []string{string(innerJSON)},
+				},
+			},
+			"outputs": []map[string]any{{"name": "output"}},
+		}
+		bodyBytes, err = json.Marshal(wrapper)
+		if err != nil {
+			return nil, fmt.Errorf("[Parse] failed to serialize HPS wrapper body, %w", err)
+		}
+	} else {
+		var err error
+		bodyBytes, err = json.Marshal(reqBody)
+		if err != nil {
+			return nil, fmt.Errorf("[Parse] failed to serialize the request body, %w", err)
+		}
 	}
 
 	req, err := http.NewRequest("POST", p.apiConfig.URL, bytes.NewReader(bodyBytes))
@@ -131,18 +168,34 @@ func (p *ppstructureParser) Parse(ctx context.Context, reader io.Reader, opts ..
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("[Parse] request failed, %w", err)
-	}
-
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("[Parse] failed to read the response body, %w", err)
 	}
 
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("[Parse] unexpected status %d: %s", resp.StatusCode, string(respBody))
+	}
+
 	var res ppstructureResponse
-	if err := json.Unmarshal(respBody, &res); err != nil {
-		return nil, fmt.Errorf("[Parse] failed to deserialize the response body, %w", err)
+	// Try basic serving response first
+	if err := json.Unmarshal(respBody, &res); err == nil && res.Result != nil && res.Result.LayoutParsingResults != nil {
+		// ok
+	} else {
+		// Fallback to HPS (Triton) response parsing
+		var hps hpsResponse
+		if err := json.Unmarshal(respBody, &hps); err == nil {
+			if len(hps.Outputs) > 0 && len(hps.Outputs[0].Data) > 0 {
+				inner := hps.Outputs[0].Data[0]
+				if err := json.Unmarshal([]byte(inner), &res); err != nil {
+					return nil, fmt.Errorf("[Parse] failed to deserialize HPS inner response, %w", err)
+				}
+			} else {
+				return nil, fmt.Errorf("[Parse] invalid HPS response body: %s", string(respBody))
+			}
+		} else {
+			return nil, fmt.Errorf("[Parse] failed to deserialize the response body, %w", err)
+		}
 	}
 
 	if res.Result == nil ||
@@ -321,4 +374,15 @@ func (p *ppstructureParser) newRequestBody(file string, fileType int, extractIma
 	}
 
 	return payload
+}
+
+// Auto-detect or honor configured HPS mode
+func (p *ppstructureParser) isHPS() bool {
+	if p.apiConfig == nil {
+		return false
+	}
+	if p.apiConfig.UseHPS != nil {
+		return *p.apiConfig.UseHPS
+	}
+	return strings.Contains(p.apiConfig.URL, "/v2/models/")
 }

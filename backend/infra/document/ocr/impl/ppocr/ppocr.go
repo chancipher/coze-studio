@@ -20,8 +20,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/coze-dev/coze-studio/backend/infra/document/ocr"
 	"github.com/coze-dev/coze-studio/backend/pkg/errorx"
@@ -31,6 +33,10 @@ import (
 type Config struct {
 	Client *http.Client
 	URL    string
+
+	// UseHPS enables Triton/HPS request wrapping and response parsing.
+	// If nil, it will be auto-detected by URL containing "/v2/models/".
+	UseHPS *bool
 
 	// see: https://paddlepaddle.github.io/PaddleX/latest/pipeline_usage/tutorials/ocr_pipelines/OCR.html#3
 	UseDocOrientationClassify *bool
@@ -65,7 +71,20 @@ type ppocrInnerResult struct {
 }
 
 type ppocrPrunedResult struct {
+	RecTexts       []string              `json:"rec_texts"`
+	OverallOCRRes  *ppocrOverallOCRRes   `json:"overall_ocr_res"`
+}
+
+type ppocrOverallOCRRes struct {
 	RecTexts []string `json:"rec_texts"`
+}
+
+// hpsResponse matches Triton HTTP JSON response schema used by PaddleX HPS.
+type hpsResponse struct {
+	Outputs []struct {
+		Name string   `json:"name"`
+		Data []string `json:"data"`
+	} `json:"outputs"`
 }
 
 func (o *ppocrImpl) FromBase64(ctx context.Context, b64 string) ([]string, error) {
@@ -106,6 +125,9 @@ func (o *ppocrImpl) newRequestBody(file string) map[string]interface{} {
 	if o.config.TextDetThresh != nil {
 		payload["textDetThresh"] = *o.config.TextDetThresh
 	}
+	if o.config.TextDetBoxThresh != nil {
+		payload["textDetBoxThresh"] = *o.config.TextDetBoxThresh
+	}
 	if o.config.TextDetUnclipRatio != nil {
 		payload["textDetUnclipRatio"] = *o.config.TextDetUnclipRatio
 	}
@@ -116,9 +138,37 @@ func (o *ppocrImpl) newRequestBody(file string) map[string]interface{} {
 }
 
 func (o *ppocrImpl) makeRequest(reqBody map[string]interface{}) ([]string, error) {
-	bodyBytes, err := json.Marshal(reqBody)
-	if err != nil {
-		return nil, errorx.WrapByCode(err, errno.ErrKnowledgeNonRetryableCode)
+	// Build request body depending on serving mode
+	var bodyBytes []byte
+	var err error
+	if o.isHPS() {
+		// Wrap as Triton inference payload per PaddleX HPS docs
+		innerJSON, err := json.Marshal(reqBody)
+		if err != nil {
+			return nil, errorx.WrapByCode(err, errno.ErrKnowledgeNonRetryableCode)
+		}
+		wrapper := map[string]interface{}{
+			"inputs": []map[string]interface{}{
+				{
+					"name":     "input",
+					"shape":    []int{1, 1},
+					"datatype": "BYTES",
+					"data":     []string{string(innerJSON)},
+				},
+			},
+			"outputs": []map[string]interface{}{
+				{"name": "output"},
+			},
+		}
+		bodyBytes, err = json.Marshal(wrapper)
+		if err != nil {
+			return nil, errorx.WrapByCode(err, errno.ErrKnowledgeNonRetryableCode)
+		}
+	} else {
+		bodyBytes, err = json.Marshal(reqBody)
+		if err != nil {
+			return nil, errorx.WrapByCode(err, errno.ErrKnowledgeNonRetryableCode)
+		}
 	}
 
 	req, err := http.NewRequest("POST", o.config.URL, bytes.NewReader(bodyBytes))
@@ -133,28 +183,72 @@ func (o *ppocrImpl) makeRequest(reqBody map[string]interface{}) ([]string, error
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, errorx.WrapByCode(err, errno.ErrKnowledgeNonRetryableCode)
-	}
-
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, errorx.WrapByCode(err, errno.ErrKnowledgeNonRetryableCode)
 	}
 
-	var res ppocrResponse
-	if err := json.Unmarshal(respBody, &res); err != nil {
-		return nil, errorx.WrapByCode(err, errno.ErrKnowledgeNonRetryableCode)
+	if resp.StatusCode != http.StatusOK {
+		return nil, errorx.WrapByCode(fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(respBody)), errno.ErrKnowledgeNonRetryableCode)
 	}
 
+	// Try basic serving response first
+	var basic ppocrResponse
+	if err := json.Unmarshal(respBody, &basic); err == nil {
+		if rec, ok := extractRecTexts(basic); ok {
+			return rec, nil
+		}
+	}
+
+	// Fallback to HPS (Triton) response parsing
+	var hps hpsResponse
+	if err := json.Unmarshal(respBody, &hps); err == nil {
+		if len(hps.Outputs) > 0 && len(hps.Outputs[0].Data) > 0 {
+			inner := hps.Outputs[0].Data[0]
+			var wrapped ppocrResponse
+			if err := json.Unmarshal([]byte(inner), &wrapped); err == nil {
+				if rec, ok := extractRecTexts(wrapped); ok {
+					return rec, nil
+				}
+			}
+		}
+	}
+
+	return nil, errorx.WrapByCode(fmt.Errorf("invalid response body: %s", string(respBody)), errno.ErrKnowledgeNonRetryableCode)
+}
+
+func (o *ppocrImpl) isHPS() bool {
+	if o.config == nil {
+		return false
+	}
+	if o.config.UseHPS != nil {
+		return *o.config.UseHPS
+	}
+	// Auto-detect by URL pattern
+	return strings.Contains(o.config.URL, "/v2/models/")
+}
+
+func extractRecTexts(res ppocrResponse) ([]string, bool) {
 	if res.Result == nil ||
 		res.Result.OCRResults == nil ||
-		len(res.Result.OCRResults) != 1 ||
+		len(res.Result.OCRResults) == 0 ||
 		res.Result.OCRResults[0] == nil ||
-		res.Result.OCRResults[0].PrunedResult == nil ||
-		res.Result.OCRResults[0].PrunedResult.RecTexts == nil {
-		return nil, errorx.WrapByCode(err, errno.ErrKnowledgeNonRetryableCode)
+		res.Result.OCRResults[0].PrunedResult == nil {
+		return nil, false
 	}
-
-	return res.Result.OCRResults[0].PrunedResult.RecTexts, nil
+	pr := res.Result.OCRResults[0].PrunedResult
+	// Prefer prunedResult.overall_ocr_res.rec_texts when available (HPS variant)
+	if pr.OverallOCRRes != nil {
+		if pr.OverallOCRRes.RecTexts != nil {
+			return pr.OverallOCRRes.RecTexts, true
+		}
+		// overall_ocr_res present but no rec_texts -> treat as empty result
+		return []string{}, true
+	}
+	// Fallback to prunedResult.rec_texts
+	if pr.RecTexts != nil {
+		return pr.RecTexts, true
+	}
+	// pruned result present but no fields -> empty result
+	return []string{}, true
 }

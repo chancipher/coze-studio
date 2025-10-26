@@ -34,3 +34,6 @@
 *.iml
 *.iws
 *.ipr
+
+# Do NOT exclude .deno_cache - we need it for Docker build
+# !backend/.deno_cache

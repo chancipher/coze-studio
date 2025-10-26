@@ -27,20 +27,28 @@ FROM alpine:3.22.0
 
 WORKDIR /app
 
-# Install runtime deps; use system numpy/pillow to avoid compiling heavy wheels
-RUN apk add --no-cache \
-    pax-utils python3 py3-numpy py3-pillow \
-    bind-tools file curl
+# Install runtime dependencies for Go app and base for Python
+# pax-utils for scanelf, python3 for running Python, python3-dev for headers/shared libs
+# bind-tools for nslookup etc., file for debugging file types
+RUN apk add --no-cache pax-utils python3 python3-dev bind-tools file deno curl
 
-# Create venv that can use system site-packages (numpy/pillow)
-RUN python3 -m venv --system-site-packages --copies --upgrade-deps /app/.venv && \
+# Install Python build dependencies, create venv, install packages, then remove build deps
+RUN apk add --no-cache --virtual .python-build-deps build-base py3-pip git && \
+    python3 -m venv --copies --upgrade-deps /app/.venv && \
+    # Activate venv and install packages
     . /app/.venv/bin/activate && \
-    pip install --no-cache-dir \
-      urllib3==1.26.16 \
-      h11==0.16.0 \
-      httpx==0.28.1 \
-      pdfplumber==0.11.7 \
-      python-docx==1.2.0
+    # If you want to use other third-party libraries, you can install them here.
+    pip install urllib3==1.26.16 && \
+    pip install --no-cache-dir h11==0.16.0 httpx==0.28.1 pillow==11.2.1 pdfplumber==0.11.7 python-docx==1.2.0 numpy==2.3.1 && \
+    # Deactivate (optional, as RUN is a new shell)
+    # deactivate && \
+    # Remove build dependencies
+    apk del .python-build-deps
+
+# Copy pre-downloaded Deno cache from local directory
+# Run prepare-deno-cache.sh before building the Docker image to generate this cache
+ENV DENO_DIR=/app/.deno_cache
+COPY backend/.deno_cache /app/.deno_cache
 
 # Copy the built Go binary from the builder stage
 COPY --from=builder /app/opencoze /app/opencoze
