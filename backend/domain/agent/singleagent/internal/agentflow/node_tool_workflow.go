@@ -41,24 +41,14 @@ func newWorkflowTools(ctx context.Context, conf *workflowConfig) ([]workflow.Too
 		})
 	}
 
+	// Do NOT mark workflow tools as return-directly; always return tool messages to the model
 	toolsReturnDirectly := make(map[string]struct{})
 
 	workflowTools, err := crossworkflow.DefaultSVC().WorkflowAsModelTool(ctx, policies)
 
-	if len(workflowTools) > 0 {
-		for _, workflowTool := range workflowTools {
-			if workflowTool.TerminatePlan() == vo.UseAnswerContent {
-				toolInfo, err := workflowTool.Info(ctx)
-				if err != nil {
-					return nil, nil, err
-				}
-				if toolInfo == nil || toolInfo.Name == "" {
-					continue
-				}
-				toolsReturnDirectly[toolInfo.Name] = struct{}{}
-			}
-		}
-	}
+	// Previously we added tools with terminate plan UseAnswerContent to toolsReturnDirectly.
+	// This leads to OpenAI rejecting when multiple tool_calls appear in one assistant turn.
+	// We now rely on ToolMidAnswer streaming for UX, while still returning proper tool messages.
 
 	return workflowTools, toolsReturnDirectly, err
 }

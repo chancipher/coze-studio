@@ -116,7 +116,9 @@ func (h *httpCallImpl) Do(ctx context.Context, args *InvocationArgs) (request st
 
 	logs.CtxDebugf(ctx, "[execute] status=%s, response=%s", httpResp.Status(), httpResp.String())
 
-	if httpResp.StatusCode() != http.StatusOK {
+	if httpResp.StatusCode() != http.StatusOK &&
+		httpResp.StatusCode() != http.StatusCreated &&
+		httpResp.StatusCode() != http.StatusAccepted {
 		return "", "", errorx.New(errno.ErrPluginExecuteToolFailed,
 			errorx.KVf(errno.PluginMsgKey, "http request failed, status=%s\nresp=%s", httpResp.Status(), httpResp.String()))
 	}

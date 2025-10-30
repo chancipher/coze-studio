@@ -45,6 +45,9 @@ RUN apk add --no-cache --virtual .python-build-deps build-base py3-pip git && \
     # Remove build dependencies
     apk del .python-build-deps
 
+RUN apk add --no-cache wget curl ca-certificates openssl \
+ && update-ca-certificates
+
 # Copy pre-downloaded Deno cache from local directory
 # Run prepare-deno-cache.sh before building the Docker image to generate this cache
 ENV DENO_DIR=/app/.deno_cache

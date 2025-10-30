@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 
 	"github.com/cloudwego/eino/callbacks"
@@ -63,6 +64,10 @@ type replyChunkCallback struct {
 	sw                  *schema.StreamWriter[*entity.AgentEvent]
 	executeID           string
 	returnDirectlyTools map[string]struct{}
+
+	// Track current tools invocation
+	toolCallOrder   []string            // order of tool_call_ids as produced by assistant
+	toolCallID2Name map[string]string   // tool_call_id -> tool name
 }
 
 func (r *replyChunkCallback) OnError(ctx context.Context, info *callbacks.RunInfo, err error) context.Context {
@@ -114,9 +119,29 @@ func (r *replyChunkCallback) OnStart(ctx context.Context, info *callbacks.RunInf
 		if info.Name != keyOfReActAgentToolsNode {
 			return ctx
 		}
+		msg := convToolsNodeCallbackInput(input)
+		if msg != nil && len(msg.ToolCalls) > 0 {
+			// capture tool_call ids and names for later backfill
+			r.toolCallOrder = r.toolCallOrder[:0]
+			if r.toolCallID2Name == nil {
+				r.toolCallID2Name = make(map[string]string)
+			} else {
+				for k := range r.toolCallID2Name {
+					delete(r.toolCallID2Name, k)
+				}
+			}
+			for _, tc := range msg.ToolCalls {
+				id := tc.ID
+				name := tc.Function.Name
+				if id != "" {
+					r.toolCallOrder = append(r.toolCallOrder, id)
+					r.toolCallID2Name[id] = name
+				}
+			}
+		}
 		ae := &entity.AgentEvent{
 			EventType: singleagent.EventTypeOfFuncCall,
-			FuncCall:  convToolsNodeCallbackInput(input),
+			FuncCall:  msg,
 		}
 		r.sw.Send(ae, nil)
 	}
@@ -167,9 +192,16 @@ func (r *replyChunkCallback) OnEnd(ctx context.Context, info *callbacks.RunInfo,
 					Suggest:   item,
 				}
 				r.sw.Send(suggestionEvent, nil)
-			}
+				}
 		}
-
+	case keyOfReActAgentToolsNode:
+		msgs := convToolsNodeCallbackOutput(output)
+		if len(msgs) > 0 {
+			r.sw.Send(&entity.AgentEvent{
+				EventType:    singleagent.EventTypeOfToolsMessage,
+				ToolsMessage: msgs,
+			}, nil)
+		}
 	default:
 		return ctx
 	}
@@ -198,16 +230,7 @@ func (r *replyChunkCallback) OnEndWithStreamOutput(ctx context.Context, info *ca
 		}, nil)
 		return ctx
 	case compose.ComponentOfToolsNode:
-		toolsMessage, err := r.concatToolsNodeOutput(ctx, output)
-		if err != nil {
-			r.sw.Send(nil, err)
-			return ctx
-		}
-
-		r.sw.Send(&entity.AgentEvent{
-			EventType:    singleagent.EventTypeOfToolsMessage,
-			ToolsMessage: toolsMessage,
-		}, nil)
+		// Do not consume tool stream here; the graph needs it to feed tool results back to the model.
 		return ctx
 	default:
 		return ctx
@@ -268,7 +291,10 @@ func convInterruptEventType(interruptEvent any) singleagent.InterruptEventType {
 }
 
 func (r *replyChunkCallback) concatToolsNodeOutput(ctx context.Context, output *schema.StreamReader[callbacks.CallbackOutput]) ([]*schema.Message, error) {
-	var toolsMsgChunks [][]*schema.Message
+	// Group by tool_call_id to avoid index-order mismatches across chunks
+	chunksByID := make(map[string][]*schema.Message)
+	order := make([]string, 0, 4) // preserve first-seen order of tool_call_ids
+
 	var sr *schema.StreamReader[*schema.Message]
 	var sw *schema.StreamWriter[*schema.Message]
 	defer func() {
@@ -277,15 +303,14 @@ func (r *replyChunkCallback) concatToolsNodeOutput(ctx context.Context, output *
 		}
 	}()
 	var streamInitialized bool
-	returnDirectToolsMap := make(map[int]bool)
-	isReturnDirectToolsFirstCheck := true
-	isToolsMsgChunksInit := false
+	returnDirectByID := make(map[string]bool)
+	checkedID := make(map[string]bool)
+
 	for {
 		cbOut, err := output.Recv()
 		if errors.Is(err, io.EOF) {
 			break
 		}
-
 		if err != nil {
 			if sw != nil {
 				sw.Send(nil, err)
@@ -294,51 +319,100 @@ func (r *replyChunkCallback) concatToolsNodeOutput(ctx context.Context, output *
 		}
 
 		msgs := convToolsNodeCallbackOutput(cbOut)
-
-		if !isToolsMsgChunksInit {
-			isToolsMsgChunksInit = true
-			toolsMsgChunks = make([][]*schema.Message, len(msgs))
-		}
-
 		for mIndex, msg := range msgs {
-
 			if msg == nil {
 				continue
 			}
-			if len(r.returnDirectlyTools) > 0 {
-				if isReturnDirectToolsFirstCheck {
-					isReturnDirectToolsFirstCheck = false
-					if _, ok := r.returnDirectlyTools[msg.ToolName]; ok {
-						returnDirectToolsMap[mIndex] = true
-					}
-				}
 
-				if _, ok := returnDirectToolsMap[mIndex]; ok {
-					if !streamInitialized {
-						sr, sw = schema.Pipe[*schema.Message](5)
-						r.sw.Send(&entity.AgentEvent{
-							EventType:             singleagent.EventTypeOfToolsAsChatModelStream,
-							ToolAsChatModelAnswer: sr,
-						}, nil)
-						streamInitialized = true
-					}
-					sw.Send(msg, nil)
+			callID := msg.ToolCallID
+			if callID == "" {
+				// Fallback key (should rarely happen if upstream sets call_id)
+				callID = fmt.Sprintf("idx_%d", mIndex)
+			}
+
+			if !checkedID[callID] && len(r.returnDirectlyTools) > 0 {
+				checkedID[callID] = true
+				// Prefer mapping from OnStart to decide return-directly by tool name
+				var toolName string
+				if r.toolCallID2Name != nil {
+					toolName = r.toolCallID2Name[callID]
 				}
+				if toolName == "" {
+					toolName = msg.ToolName
+				}
+				if _, ok := r.returnDirectlyTools[toolName]; ok {
+					returnDirectByID[callID] = true
+				}
+				order = append(order, callID)
+			} else if _, exists := chunksByID[callID]; !exists {
+				// New id discovered after first wave
+				order = append(order, callID)
 			}
-			if toolsMsgChunks[mIndex] == nil {
-				toolsMsgChunks[mIndex] = []*schema.Message{msg}
-			} else {
-				toolsMsgChunks[mIndex] = append(toolsMsgChunks[mIndex], msg)
+
+			// Stream directly for this tool_call if configured
+			if returnDirectByID[callID] {
+				if !streamInitialized {
+					sr, sw = schema.Pipe[*schema.Message](5)
+					r.sw.Send(&entity.AgentEvent{
+						EventType:             singleagent.EventTypeOfToolsAsChatModelStream,
+						ToolAsChatModelAnswer: sr,
+					}, nil)
+					streamInitialized = true
+				}
+				sw.Send(msg, nil)
 			}
+
+			chunksByID[callID] = append(chunksByID[callID], msg)
 		}
 	}
 
-	toolMessages := make([]*schema.Message, 0, len(toolsMsgChunks))
+	// Backfill any missing tool_call_ids (especially returnDirectly tools that may not emit chunks)
+	if len(r.toolCallOrder) > 0 {
+		for _, callID := range r.toolCallOrder {
+			if _, ok := chunksByID[callID]; ok {
+				continue
+			}
+			toolName := ""
+			if r.toolCallID2Name != nil {
+				toolName = r.toolCallID2Name[callID]
+			}
+			if toolName != "" {
+				if _, isDirect := r.returnDirectlyTools[toolName]; isDirect {
+					// synthesize minimal tool message to satisfy model requirement
+					chunksByID[callID] = []*schema.Message{{
+						Role:       schema.Tool,
+						Content:    "directly streaming reply",
+						ToolCallID: callID,
+						ToolName:   toolName,
+					}}
+					order = append(order, callID)
+				}
+			}
+		}
+		// clear after use
+		r.toolCallOrder = nil
+		r.toolCallID2Name = nil
+	}
 
-	for _, msgChunks := range toolsMsgChunks {
-		msg, err := schema.ConcatMessages(msgChunks)
+	toolMessages := make([]*schema.Message, 0, len(chunksByID))
+	for _, callID := range order {
+		msgs := chunksByID[callID]
+		if len(msgs) == 0 {
+			continue
+		}
+		msg, err := schema.ConcatMessages(msgs)
 		if err != nil {
 			return nil, err
+		}
+		if msg.ToolCallID == "" {
+			msg.ToolCallID = callID
+		}
+		// Ensure role and name are preserved
+		if msg.Role == "" {
+			msg.Role = schema.Tool
+		}
+		if msg.ToolName == "" && r.toolCallID2Name != nil {
+			msg.ToolName = r.toolCallID2Name[callID]
 		}
 		toolMessages = append(toolMessages, msg)
 	}
